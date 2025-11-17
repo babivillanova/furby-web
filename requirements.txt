@@ -1,0 +1,16 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+bleak>=0.22
+python-dotenv>=1.0
+# PyFluff diretamente do Git (mantém o app pronto para o modo real)
+# Se não quiser instalar agora, você pode comentar a linha abaixo
+git+https://github.com/martinwoodward/PyFluff.git
+# Porcupine para wake word detection
+pvporcupine>=3.0.0
+pyaudio>=0.2.13
+# OpenAI para conversação
+openai>=1.12.0
+pydub>=0.25.1
+requests>=2.31.0
+
+
