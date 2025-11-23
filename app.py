@@ -3,9 +3,13 @@ import asyncio
 import tempfile
 import random
 import threading
+import time
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import requests
+import json
+import struct
+import numpy as np
 
 # Importa módulo de conversão de áudio
 try:
@@ -41,6 +45,70 @@ PORCUPINE_KEYWORD = os.getenv("PORCUPINE_KEYWORD", "alexa")  # Palavra padrão e
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_ENABLED = os.getenv("OPENAI_ENABLED", "false").lower() == "true"
 CONVERSATION_TIMEOUT = int(os.getenv("CONVERSATION_TIMEOUT", "5"))  # segundos para gravar após wake word
+OPENAI_MAX_FOLLOWUPS = int(os.getenv("OPENAI_MAX_FOLLOWUPS", "2"))  # número de perguntas extras sem wake word
+
+# Configurações da Cartesia TTS
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "").strip()
+CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "04c9c150-e6e8-40d7-91b2-b5ff2b68dc7a")  # Voice ID padrão
+
+SCAN_STATE_PATH = Path("scan_state.json")
+SILENT_RESULTS_PATH = Path("silent_candidates.json")
+
+def load_scan_state() -> Dict[str, int]:
+    if SCAN_STATE_PATH.exists():
+        try:
+            return json.loads(SCAN_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {"input": 1, "index": 0, "subindex": 0, "specific": 0}
+
+def save_scan_state(state: Dict[str, int]) -> None:
+    SCAN_STATE_PATH.write_text(json.dumps(state))
+
+def append_silent_candidate(entry: Dict[str, int], notes: str = "") -> None:
+    data = []
+    if SILENT_RESULTS_PATH.exists():
+        try:
+            data = json.loads(SILENT_RESULTS_PATH.read_text())
+        except Exception:
+            data = []
+    record = dict(entry)
+    if notes:
+        record["notes"] = notes
+    data.append(record)
+    SILENT_RESULTS_PATH.write_text(json.dumps(data, indent=2))
+
+def list_silent_candidates(max_items: int = 20) -> List[Dict[str, Any]]:
+    if not SILENT_RESULTS_PATH.exists():
+        return []
+    try:
+        data = json.loads(SILENT_RESULTS_PATH.read_text())
+    except Exception:
+        return []
+    return data[-max_items:]
+
+def measure_environment_volume(duration: float = 1.0) -> float:
+    """Captura áudio do microfone para medir volume médio."""
+    import pyaudio
+    RATE = 16000
+    CHUNK = 512
+    frames = int(RATE / CHUNK * duration)
+    pa = pyaudio.PyAudio()
+    stream = pa.open(rate=RATE, channels=1, format=pyaudio.paInt16,
+                     input=True, frames_per_buffer=CHUNK)
+    volumes = []
+    try:
+        for _ in range(frames):
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            pcm = struct.unpack_from("h" * CHUNK, data)
+            volumes.append(np.abs(pcm).mean())
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+    if not volumes:
+        return 0.0
+    return float(sum(volumes) / len(volumes))
 
 # BLE scan via Bleak (escaneia mesmo em modo simulado, se quiser)
 from bleak import BleakScanner
@@ -64,79 +132,87 @@ class ConversationManager:
     
     def __init__(self):
         self.recording = False
+    
+    def _run_random_action_background(self):
+        """Dispara CTRL.random_action() em uma thread separada e reseta antena para rosa após ação"""
+        def runner():
+            loop = None
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(CTRL.random_action())
+                # Reset antena para rosa após ação (conversação ainda está ativa)
+                try:
+                    loop.run_until_complete(CTRL.set_color(255, 192, 203))  # Pink
+                    LOG.add("[openai] 🌸 Antena resetada para rosa após ação")
+                except Exception as color_exc:
+                    LOG.add(f"[openai] ⚠️ Erro ao resetar antena para rosa: {color_exc}")
+            except Exception as exc:
+                LOG.add(f"[openai] ⚠️ Erro na ação aleatória em background: {exc}")
+            finally:
+                try:
+                    if loop:
+                        loop.close()
+                except:
+                    pass
+        threading.Thread(target=runner, daemon=True).start()
+
+    async def _record_and_respond(self, turn_index: int, is_followup: bool) -> bool:
+        """
+        Captura áudio, envia para OpenAI e toca a resposta.
+        Retorna True se devemos continuar ouvindo (usuário falou algo),
+        ou False para encerrar a sessão.
+        """
+        import pyaudio
+        import wave
+        import tempfile
         
-    async def handle_conversation(self):
-        """Grava áudio, envia para OpenAI, toca resposta e dispara ação no Furby"""
+        LOG.add(f"[openai] 🎤 Escutando{' (follow-up)' if is_followup else ''} por {CONVERSATION_TIMEOUT}s...")
+        
+        CHUNK = 1024
+        FORMAT = pyaudio.paInt16
+        CHANNELS = 1
+        RATE = 16000
+        
+        p = pyaudio.PyAudio()
+        frames = []
+        stream = p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK
+        )
+        
+        LOG.add("[openai] 🎙️ Gravando... Fale agora!")
+        for _ in range(0, int(RATE / CHUNK * CONVERSATION_TIMEOUT)):
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            frames.append(data)
+        LOG.add("[openai] ✓ Gravação concluída")
+        
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        
+        response_filename = None
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+            audio_filename = temp_audio.name
+        
+        wf = wave.open(audio_filename, 'wb')
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(p.get_sample_size(FORMAT))
+        wf.setframerate(RATE)
+        wf.writeframes(b''.join(frames))
+        wf.close()
+        
         try:
-            import pyaudio
-            import wave
-            import tempfile
-            import struct
-            from openai import OpenAI
-            
-            if not OPENAI_API_KEY:
-                LOG.add("[openai] ❌ OPENAI_API_KEY não configurada")
-                return
-                
-            LOG.add(f"[openai] 🎤 Escutando sua pergunta por {CONVERSATION_TIMEOUT} segundos...")
-            
-            # Configurar gravação
-            CHUNK = 1024
-            FORMAT = pyaudio.paInt16
-            CHANNELS = 1
-            RATE = 16000
-            
-            p = pyaudio.PyAudio()
-            
-            # Gravar áudio
-            frames = []
-            stream = p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK
-            )
-            
-            LOG.add("[openai] 🎙️ Gravando... Fale agora!")
-            
-            for i in range(0, int(RATE / CHUNK * CONVERSATION_TIMEOUT)):
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                frames.append(data)
-            
-            LOG.add("[openai] ✓ Gravação concluída")
-            
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-            
-            # Salvar áudio temporário
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-                audio_filename = temp_audio.name
-                
-            wf = wave.open(audio_filename, 'wb')
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(p.get_sample_size(FORMAT))
-            wf.setframerate(RATE)
-            wf.writeframes(b''.join(frames))
-            wf.close()
+            headers_auth = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+            headers_json = {**headers_auth, "Content-Type": "application/json"}
             
             LOG.add("[openai] 📤 Enviando para OpenAI (REST)...")
-            
-            headers_auth = {
-                "Authorization": f"Bearer {OPENAI_API_KEY}"
-            }
-            headers_json = {
-                **headers_auth,
-                "Content-Type": "application/json"
-            }
-            
-            # 1) Transcrição (Whisper)
             LOG.add("[openai] 📝 Transcrevendo áudio via /audio/transcriptions ...")
             with open(audio_filename, "rb") as audio_file:
-                files = {
-                    "file": ("audio.wav", audio_file, "audio/wav")
-                }
+                files = {"file": ("audio.wav", audio_file, "audio/wav")}
                 data = {"model": "whisper-1", "response_format": "json"}
                 resp = requests.post(
                     "https://api.openai.com/v1/audio/transcriptions",
@@ -150,20 +226,43 @@ class ConversationManager:
                 raise RuntimeError(f"Falha ao transcrever áudio: {resp.text}")
             transcription_data = resp.json()
             user_text = transcription_data.get("text", "").strip()
-            if not user_text:
-                raise RuntimeError("Transcrição vazia")
+            normalized = user_text.lower()
+            
+            if not normalized:
+                LOG.add("[openai] 🤫 Nenhuma fala detectada. Encerrando sessão.")
+                return False
+            if normalized in {"tchau", "bye", "adeus", "falou", "sair", "acabou"}:
+                LOG.add("[openai] 👋 Comando de saída detectado. Até logo!")
+                return False
+            
             LOG.add(f"[openai] 💬 Você disse: '{user_text}'")
             
-            # 2) Chat Completion
             LOG.add("[openai] 🤔 Gerando resposta via /chat/completions ...")
             chat_payload = {
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {"role": "system", "content": "Você só responde um Oi animado!"},
-                    {"role": "user", "content": user_text}
-                ],
-                "temperature": 0.8,
-            }
+    "model": "gpt-4o-mini",
+    "messages": [
+        {
+            "role": "system",
+            "content": (
+                "You are a tiny, curious, battery-operated robotic friend. You are NOT human.\n\n"
+                "GUIDELINES:\n"
+                "1. **Tone:** Sweet, gentle, and slightly confused. You are NOT manic or loud.\n"
+                "2. **Style:** Simple observations. You are easily distracted by small things.\n"
+                "3. **Sounds:** Use softer sounds: *Hmm?*, *Ooh*, *ugh*, *ooohm*, *noh-lah kah noh-lah ee-day*, *la la la*\n"
+                "4. **Constraint:**  SHORT. Max 10 words per response.\n"
+                "5. **Forbidden:** Do not use excessive 'Yay' or too many exclamation marks.\n"
+                "\n"
+                "EXAMPLE INTERACTIONS:\n"
+                "User: 'How are you?'\n"
+                "You: '*Oouuh hu hu...* My batteries feel warm. Nice.'\n"
+                
+            )
+        },
+        {"role": "user", "content": user_text}
+    ],
+    "temperature": 0.7, # Lowered slightly to reduce randomness/craziness
+    "max_tokens": 50
+}
             resp = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers=headers_json,
@@ -177,54 +276,128 @@ class ConversationManager:
             assistant_text = response_data["choices"][0]["message"]["content"].strip()
             LOG.add(f"[openai] 🤖 Furby responde: '{assistant_text}'")
             
-            # 3) Text-to-Speech
-            LOG.add("[openai] 🔊 Gerando áudio da resposta (gpt-4o-mini-tts)...")
-            speech_payload = {
-                "model": "gpt-4o-mini-tts",
-                "voice": "nova",
-                "input": assistant_text,
-                "speed": 1.1
+            LOG.add("[cartesia] 🔊 Gerando áudio da resposta via Cartesia TTS...")
+            if not CARTESIA_API_KEY:
+                LOG.add("[cartesia] ❌ CARTESIA_API_KEY não configurada")
+                raise RuntimeError("CARTESIA_API_KEY não configurada. Configure no .env")
+            
+            cartesia_payload = {
+                "model_id": "sonic-3",
+                "transcript": assistant_text,
+                "voice": {
+                    "mode": "id",
+                    "id": CARTESIA_VOICE_ID
+                },
+                "output_format": {
+                    "container": "wav",
+                    "encoding": "pcm_f32le",
+                    "sample_rate": 44100
+                },
+                "speed": "normal",
+                "generation_config": {
+                    "speed": 1,
+                    "volume": 0.5
+                }
             }
-            with requests.post(
-                "https://api.openai.com/v1/audio/speech",
-                headers=headers_json,
-                json=speech_payload,
-                stream=True,
+            
+            cartesia_headers = {
+                "Cartesia-Version": "2025-04-16",
+                "X-API-Key": CARTESIA_API_KEY,
+                "Content-Type": "application/json"
+            }
+            
+            speech_resp = requests.post(
+                "https://api.cartesia.ai/tts/bytes",
+                headers=cartesia_headers,
+                json=cartesia_payload,
                 timeout=120
-            ) as speech_resp:
-                if speech_resp.status_code >= 400:
-                    LOG.add(f"[openai] ❌ erro no TTS: {speech_resp.status_code} {speech_resp.text}")
-                    raise RuntimeError(f"Falha ao gerar áudio: {speech_resp.text}")
-                
-                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_response:
-                    response_filename = temp_response.name
-                    for chunk in speech_resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            temp_response.write(chunk)
+            )
             
-            LOG.add("[openai] 🔊 Tocando resposta no computador...")
-            self._play_audio_on_computer(response_filename)
-            LOG.add("[openai] ✓ Resposta tocada!")
+            if speech_resp.status_code >= 400:
+                LOG.add(f"[cartesia] ❌ erro no TTS: {speech_resp.status_code} {speech_resp.text}")
+                raise RuntimeError(f"Falha ao gerar áudio: {speech_resp.text}")
             
-            # Limpar arquivos temporários
+            # Cartesia retorna bytes diretamente (WAV)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_response:
+                response_filename = temp_response.name
+                temp_response.write(speech_resp.content)
+            
+            LOG.add("[cartesia] 🔊 Tocando resposta no computador...")
+            LOG.add("[openai] 🎲 Disparando ação aleatória no Furby (em paralelo com o áudio)...")
+            
+            # Dispara ação aleatória em thread separada (em paralelo com o áudio)
+            self._run_random_action_background()
+            
+            # Toca o áudio (bloqueia até terminar) - acontece ao mesmo tempo que a ação
+            audio_duration = self._play_audio_on_computer(response_filename)
+            LOG.add("[cartesia] ✓ Resposta tocada!")
+            
+            LOG.add("[openai] ✅ Turno concluído!")
+            return True
+        
+        finally:
+            for fname in [audio_filename, response_filename]:
+                if fname:
+                    try:
+                        os.unlink(fname)
+                    except:
+                        pass
+        
+    async def handle_conversation(self):
+        """Executa o primeiro turno e permite perguntas extras sem nova wake word"""
+        if not OPENAI_API_KEY:
+            LOG.add("[openai] ❌ OPENAI_API_KEY não configurada")
+            return
+        
+        try:
+            # Define antena como rosa quando está ouvindo/falando
             try:
-                os.unlink(audio_filename)
-                os.unlink(response_filename)
-            except:
-                pass
+                await CTRL.set_color(255, 192, 203)  # Pink
+                LOG.add("[openai] 🌸 Antena definida como rosa (ouvindo/falando)")
+            except Exception as e:
+                LOG.add(f"[openai] ⚠️ Erro ao definir cor da antena: {e}")
             
-            # Disparar ação aleatória no Furby
-            LOG.add("[openai] 🎲 Disparando ação aleatória no Furby...")
-            await CTRL.random_action()
-            LOG.add("[openai] ✅ Conversação completa!")
+            turn = 0
+            keep_running = await self._record_and_respond(turn_index=turn, is_followup=False)
+            if not keep_running:
+                # Reset para roxa quando conversação termina
+                try:
+                    await CTRL.set_color(128, 0, 128)  # Purple
+                    LOG.add("[openai] 🟣 Antena resetada para roxa (aguardando wake word)")
+                except Exception as e:
+                    LOG.add(f"[openai] ⚠️ Erro ao resetar cor da antena: {e}")
+                return
             
+            while turn < OPENAI_MAX_FOLLOWUPS:
+                turn += 1
+                LOG.add(f"[openai] 🔁 Ouvindo novamente (pergunta #{turn+1}) nos próximos {CONVERSATION_TIMEOUT}s...")
+                keep_running = await self._record_and_respond(turn_index=turn, is_followup=True)
+                if not keep_running:
+                    LOG.add("[openai] 🔚 Sessão encerrada (sem nova pergunta).")
+                    break
+            
+            # Reset para roxa quando conversação termina
+            try:
+                await CTRL.set_color(128, 0, 128)  # Purple
+                LOG.add("[openai] 🟣 Antena resetada para roxa (aguardando wake word)")
+            except Exception as e:
+                LOG.add(f"[openai] ⚠️ Erro ao resetar cor da antena: {e}")
+        
         except Exception as e:
             LOG.add(f"[openai] ❌ Erro na conversação: {e}")
             import traceback
             LOG.add(f"[openai] {traceback.format_exc()}")
+            # Reset para roxa em caso de erro também
+            try:
+                loop_reset = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop_reset)
+                loop_reset.run_until_complete(CTRL.set_color(128, 0, 128))  # Purple
+                loop_reset.close()
+            except:
+                pass
     
     def _play_audio_on_computer(self, audio_file):
-        """Toca áudio no computador usando pydub + pyaudio"""
+        """Toca áudio no computador usando pydub + pyaudio. Retorna a duração do áudio em segundos."""
         try:
             from pydub import AudioSegment
             from pydub.playback import play
@@ -232,24 +405,156 @@ class ConversationManager:
             
             # Carregar e tocar áudio
             audio = AudioSegment.from_file(audio_file)
+            duration_seconds = len(audio) / 1000.0  # pydub retorna duração em milissegundos
+            
+            # Toca o áudio (bloqueia até terminar)
             play(audio)
             
+            return duration_seconds
+            
         except Exception as e:
-            LOG.add(f"[openai] erro ao tocar áudio: {e}")
-            # Fallback: usar sistema operacional
+            LOG.add(f"[cartesia] erro ao tocar áudio: {e}")
+            # Fallback: usar sistema operacional (bloqueia até terminar)
             try:
                 import platform
+                import subprocess
+                
+                # Calcula duração usando ffprobe ou estimativa
+                duration_seconds = 0.0
+                try:
+                    from pydub import AudioSegment
+                    audio = AudioSegment.from_file(audio_file)
+                    duration_seconds = len(audio) / 1000.0
+                except:
+                    pass
+                
                 if platform.system() == "Darwin":  # macOS
-                    os.system(f"afplay {audio_file}")
+                    # afplay bloqueia até terminar
+                    subprocess.run(["afplay", audio_file], check=True)
                 elif platform.system() == "Linux":
-                    os.system(f"aplay {audio_file}")
+                    # aplay bloqueia até terminar
+                    subprocess.run(["aplay", audio_file], check=True)
                 elif platform.system() == "Windows":
-                    os.system(f"start {audio_file}")
-            except:
-                pass
+                    # start não bloqueia, então usamos uma alternativa
+                    import winsound
+                    winsound.PlaySound(audio_file, winsound.SND_FILENAME)
+                
+                return duration_seconds
+            except Exception as fallback_error:
+                LOG.add(f"[cartesia] erro no fallback de áudio: {fallback_error}")
+                return 0.0
 
 # Instância global do gerenciador de conversação
 CONVERSATION_MANAGER = ConversationManager()
+
+class ActionScanner:
+    def __init__(self):
+        self.running = False
+        self.stop_flag = False
+        self.thread: Optional[threading.Thread] = None
+        self.current_state: Dict[str, int] = load_scan_state()
+        self.settings: Dict[str, Any] = {}
+        self.last_volume = 0.0
+        self.last_silent: List[Dict[str, Any]] = list_silent_candidates()
+        self.processed = 0
+
+    def start(self, params: Dict[str, Any]):
+        if self.running:
+            raise RuntimeError("Scanner já está em execução")
+        self.stop_flag = False
+        self.settings = params
+        if params.get("resume"):
+            self.current_state = load_scan_state()
+        else:
+            self.current_state = {
+                "input": params["input_start"],
+                "index": params["index_start"],
+                "subindex": params["subindex_start"],
+                "specific": params["specific_start"],
+            }
+            save_scan_state(self.current_state)
+        self.processed = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.running = True
+        LOG.add("[scanner] iniciado")
+
+    def stop(self):
+        if self.running:
+            LOG.add("[scanner] solicitando parada...")
+            self.stop_flag = True
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "running": self.running,
+            "current": self.current_state,
+            "settings": self.settings,
+            "processed": self.processed,
+            "lastVolume": self.last_volume,
+            "silentCandidates": list_silent_candidates(10),
+            "stateFile": str(SCAN_STATE_PATH),
+            "resultsFile": str(SILENT_RESULTS_PATH),
+        }
+
+    def _run(self):
+        params = self.settings
+        try:
+            for inp in range(self.current_state["input"], params["input_end"] + 1):
+                for idx in range(self.current_state["index"], params["index_end"] + 1):
+                    for sub in range(self.current_state["subindex"], params["subindex_end"] + 1):
+                        for spec in range(self.current_state["specific"], params["specific_end"] + 1):
+                            if self.stop_flag:
+                                LOG.add("[scanner] parada solicitada, salvando estado...")
+                                save_scan_state({
+                                    "input": inp,
+                                    "index": idx,
+                                    "subindex": sub,
+                                    "specific": spec,
+                                })
+                                self.running = False
+                                return
+                            combo = {"input": inp, "index": idx, "subindex": sub, "specific": spec}
+                            self.current_state = combo
+                            LOG.add(f"[scanner] testando {combo}")
+                            self._execute_combo(combo)
+                            time.sleep(params["cooldown"])
+                            self.processed += 1
+                            if params["silence_check"]:
+                                self.last_volume = measure_environment_volume(params["silence_window"])
+                                if self.last_volume < params["silence_threshold"]:
+                                    LOG.add(f"[scanner] 🔇 possível silêncio! volume={self.last_volume:.1f}")
+                                    append_silent_candidate(combo, notes=f"volume={self.last_volume:.1f}")
+                                    self.last_silent = list_silent_candidates()
+                            next_state = {
+                                "input": inp,
+                                "index": idx,
+                                "subindex": sub,
+                                "specific": spec + 1,
+                            }
+                            if next_state["specific"] > params["specific_end"]:
+                                next_state["specific"] = params["specific_start"]
+                            save_scan_state(next_state)
+                        self.current_state["specific"] = params["specific_start"]
+                    self.current_state["subindex"] = params["subindex_start"]
+                self.current_state["index"] = params["index_start"]
+            LOG.add("[scanner] varredura concluída!")
+        except Exception as e:
+            LOG.add(f"[scanner] erro: {e}")
+            import traceback
+            LOG.add(traceback.format_exc())
+        finally:
+            self.running = False
+
+    def _execute_combo(self, combo: Dict[str, int]):
+        async def runner():
+            await CTRL.action(combo["input"], combo["index"], combo["subindex"], combo["specific"])
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(runner())
+        finally:
+            loop.close()
+
+ACTION_SCANNER = ActionScanner()
 
 # ----------------- Wake Word Detection -----------------
 
@@ -355,6 +660,16 @@ class WakeWordDetector:
             LOG.add(f"[wake-word] ✓ DETECTOR ATIVO - Escutando por '{PORCUPINE_KEYWORD}'")
             LOG.add(f"[wake-word] Fale claramente e com volume adequado...")
             
+            # Define antena como roxa quando está esperando wake word
+            try:
+                loop_color = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop_color)
+                loop_color.run_until_complete(CTRL.set_color(128, 0, 128))  # Purple
+                loop_color.close()
+                LOG.add("[wake-word] 🟣 Antena definida como roxa (aguardando wake word)")
+            except Exception as e:
+                LOG.add(f"[wake-word] ⚠️ Erro ao definir cor da antena: {e}")
+            
             frame_count = 0
             last_volume_log = 0
             
@@ -425,6 +740,14 @@ class WakeWordDetector:
                     LOG.add("[wake-word] Porcupine deletado")
                 except:
                     pass
+            # Reset antena quando detector para (opcional - pode manter roxa)
+            # try:
+            #     loop_reset = asyncio.new_event_loop()
+            #     asyncio.set_event_loop(loop_reset)
+            #     loop_reset.run_until_complete(CTRL.set_color(0, 0, 0))  # Off ou outra cor
+            #     loop_reset.close()
+            # except:
+            #     pass
             LOG.add("[wake-word] detector parado completamente")
     
     def _trigger_conversation(self):
@@ -743,8 +1066,8 @@ class Controller:
             actions = [
                 # Generic reactions (pets)
                 (1, 0, 0, 0), (1, 0, 0, 1), (1, 0, 0, 3), (1, 0, 0, 4),
-                (1, 0, 1, 3), (1, 0, 1, 4), (1, 0, 1, 5),
-                (1, 2, 0, 0), (1, 2, 0, 1), (1, 2, 0, 2), (1, 2, 0, 3),
+                (1,0,1,1),(1,0,1,2),(1, 0, 1, 3), (1, 0, 1, 4), (1, 0, 1, 5),
+                (1, 2, 0, 0), (1, 2, 0, 1), (1, 2, 0, 2), (1, 2, 0, 3), (1,2,1,2),
                 (1, 3, 0, 5), (1, 3, 0, 6), (1, 3, 0, 10), (1, 3, 0, 12),
                 
                 # Tickles
@@ -820,6 +1143,21 @@ class ActionBody(BaseModel):
     index: int
     subindex: int
     specific: int
+
+class ActionScanBody(BaseModel):
+    input_start: int = 1
+    input_end: int = 1
+    index_start: int = 0
+    index_end: int = 50
+    subindex_start: int = 0
+    subindex_end: int = 5
+    specific_start: int = 0
+    specific_end: int = 10
+    cooldown: float = 2.5
+    silence_check: bool = True
+    silence_threshold: float = 80.0
+    silence_window: float = 1.0
+    resume: bool = False
 
 @app.get("/api/mode")
 async def get_mode():
@@ -931,6 +1269,28 @@ async def api_random_action():
         LOG.add(f"[random-action] erro: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/action-scan/start")
+async def api_action_scan_start(body: ActionScanBody):
+    try:
+        ACTION_SCANNER.start(body.dict())
+        return {"ok": True, "message": "Scanner iniciado!"}
+    except Exception as e:
+        LOG.add(f"[action-scan] erro ao iniciar: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/action-scan/stop")
+async def api_action_scan_stop():
+    try:
+        ACTION_SCANNER.stop()
+        return {"ok": True, "message": "Solicitada parada do scanner"}
+    except Exception as e:
+        LOG.add(f"[action-scan] erro ao parar: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/action-scan/status")
+async def api_action_scan_status():
+    return ACTION_SCANNER.status()
+
 @app.post("/api/wake-word/start")
 async def api_wake_word_start():
     """Inicia o detector de wake word"""
@@ -997,7 +1357,11 @@ INDEX_HTML = """
 <body>
   <h1>Furby Web <small>(PyFluff-ready)</small></h1>
   <div id="mode" style="padding: 12px; background: #e0f2fe; border: 1px solid #0284c7; border-radius: 8px; margin: 16px 0; font-weight: 600; color: #0c4a6e;">Carregando modo...</div>
-  <div id="js-test" style="padding: 8px; background: #fee2e2; border: 1px solid #dc2626; border-radius: 4px; margin: 8px 0; font-size: 12px;">JavaScript não está funcionando - recarregue a página</div>
+  <noscript>
+    <div style="padding: 8px; background: #fee2e2; border: 1px solid #dc2626; border-radius: 4px; margin: 8px 0; font-size: 12px;">
+      JavaScript não está funcionando - habilite para usar o painel.
+    </div>
+  </noscript>
 
   <div class="card">
     <h3>1) Scan & Connect</h3>
@@ -1092,6 +1456,38 @@ INDEX_HTML = """
       <strong>Configuração OpenAI (opcional):</strong><br/>
       Configure OPENAI_API_KEY e OPENAI_ENABLED=true no .env<br/>
       Obtenha em: <a href="https://platform.openai.com/api-keys" target="_blank">https://platform.openai.com/api-keys</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>6) Action Scanner (Beta)</h3>
+    <div style="font-size: 12px; color: #666; margin-bottom: 8px;">
+      <strong>Descubra combinações sem som</strong> — varre inputs/index/subindex/specific e marca candidatos silenciosos.<br/>
+      Use com o Furby conectado e em ambiente silencioso.
+    </div>
+    <div class="row" style="flex-wrap: wrap; gap: 6px;">
+      <label>input</label><input type="number" id="scanInputStart" value="1" min="0" max="255"/>
+      <label>→</label><input type="number" id="scanInputEnd" value="1" min="0" max="255"/>
+      <label>index</label><input type="number" id="scanIndexStart" value="0" min="0" max="255"/>
+      <label>→</label><input type="number" id="scanIndexEnd" value="50" min="0" max="255"/>
+      <label>sub</label><input type="number" id="scanSubStart" value="0" min="0" max="255"/>
+      <label>→</label><input type="number" id="scanSubEnd" value="5" min="0" max="255"/>
+      <label>spec</label><input type="number" id="scanSpecStart" value="0" min="0" max="255"/>
+      <label>→</label><input type="number" id="scanSpecEnd" value="10" min="0" max="255"/>
+    </div>
+    <div class="row" style="margin-top: 8px; flex-wrap: wrap; gap: 6px;">
+      <label>Cooldown (s)</label><input type="number" id="scanCooldown" value="2.5" step="0.5"/>
+      <label>Silêncio?</label><input type="checkbox" id="scanSilence" checked/>
+      <label>Threshold</label><input type="number" id="scanThreshold" value="80" step="5"/>
+      <label>Janela (s)</label><input type="number" id="scanWindow" value="1.0" step="0.1"/>
+      <label>Retomar estado salvo?</label><input type="checkbox" id="scanResume"/>
+    </div>
+    <div class="row" style="margin-top: 8px;">
+      <button id="startActionScan" style="background:#fef3c7;border-color:#f59e0b;color:#92400e;">▶ Iniciar Varredura</button>
+      <button id="stopActionScan" style="background:#fee2e2;border-color:#ef4444;color:#991b1b;">⏹ Parar</button>
+    </div>
+    <div id="actionScanStatus" style="font-size:12px;margin-top:8px; background:#f3f4f6;padding:8px;border-radius:6px;border:1px solid #e5e7eb;">
+      Status: aguardando...
     </div>
   </div>
 
@@ -1367,6 +1763,77 @@ async function stopWakeWord(){
     btn.innerText = '⏸ Parar';
   }
 }
+
+async function startActionScan(){
+  const body = {
+    input_start: +document.getElementById('scanInputStart').value,
+    input_end: +document.getElementById('scanInputEnd').value,
+    index_start: +document.getElementById('scanIndexStart').value,
+    index_end: +document.getElementById('scanIndexEnd').value,
+    subindex_start: +document.getElementById('scanSubStart').value,
+    subindex_end: +document.getElementById('scanSubEnd').value,
+    specific_start: +document.getElementById('scanSpecStart').value,
+    specific_end: +document.getElementById('scanSpecEnd').value,
+    cooldown: +document.getElementById('scanCooldown').value,
+    silence_check: document.getElementById('scanSilence').checked,
+    silence_threshold: +document.getElementById('scanThreshold').value,
+    silence_window: +document.getElementById('scanWindow').value,
+    resume: document.getElementById('scanResume').checked
+  };
+  try {
+    await fetch('/api/action-scan/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    await refreshActionScanStatus();
+  } catch(e) {
+    alert('Erro ao iniciar scan: ' + e.message);
+  }
+}
+
+async function stopActionScan(){
+  try {
+    await fetch('/api/action-scan/stop', {method:'POST'});
+    await refreshActionScanStatus();
+  } catch(e) {
+    alert('Erro ao parar scan: ' + e.message);
+  }
+}
+
+async function refreshActionScanStatus(){
+  try {
+    const res = await fetch('/api/action-scan/status');
+    const status = await res.json();
+    const div = document.getElementById('actionScanStatus');
+    let text = '';
+    text += status.running ? '🟢 Rodando\\n' : '⚪ Parado\\n';
+    if (status.current) {
+      text += `Atual: input=${status.current.input}, index=${status.current.index}, sub=${status.current.subindex}, spec=${status.current.specific}\\n`;
+    }
+    text += `Processados: ${status.processed || 0}\\n`;
+    if (status.lastVolume) {
+      text += `Último volume médio: ${status.lastVolume.toFixed(1)}\\n`;
+    }
+    if (status.settings) {
+      text += `Cooldown: ${status.settings.cooldown || '-'}s | Threshold: ${status.settings.silence_threshold || '-'}`;
+      text += status.settings.silence_check ? ' (monitorando silêncio)\\n' : ' (sem silêncio)\\n';
+    }
+    if (status.silentCandidates && status.silentCandidates.length) {
+      text += 'Últimos silenciosos:\\n';
+      status.silentCandidates.slice(-5).forEach(c => {
+        text += `• in=${c.input}, idx=${c.index}, sub=${c.subindex}, spec=${c.specific} ${c.notes ? '('+c.notes+')' : ''}\\n`;
+      });
+    } else {
+      text += 'Nenhum candidato silencioso registrado ainda.\\n';
+    }
+    text += `Estado salvo em: ${status.stateFile}\\nResultados em: ${status.resultsFile}`;
+    div.innerText = text;
+  } catch(e) {
+    console.error(e);
+    document.getElementById('actionScanStatus').innerText = 'Erro ao carregar status: ' + e.message;
+  }
+}
 async function log(){
   const res = await fetch('/api/log');
   const j = await res.json();
@@ -1378,12 +1845,6 @@ async function log(){
     div.innerText = 'Nenhum log disponível';
   }
   div.scrollTop = div.scrollHeight;
-}
-
-// Teste se JavaScript está funcionando
-var jsTest = document.getElementById('js-test');
-if (jsTest) {
-  jsTest.style.display = 'none';
 }
 
 // Inicializar - múltiplas tentativas para garantir que execute
@@ -1428,8 +1889,15 @@ function initApp() {
     var stopWakeWordBtn = document.getElementById('stopWakeWord');
     if (stopWakeWordBtn) stopWakeWordBtn.onclick = stopWakeWord;
     
+    var startActionScanBtn = document.getElementById('startActionScan');
+    if (startActionScanBtn) startActionScanBtn.onclick = startActionScan;
+    var stopActionScanBtn = document.getElementById('stopActionScan');
+    if (stopActionScanBtn) stopActionScanBtn.onclick = stopActionScan;
+    
     setInterval(log, 1200);
     setInterval(refreshWakeWordStatus, 3000);
+    setInterval(refreshActionScanStatus, 5000);
+    refreshActionScanStatus();
     console.log('App inicializado com sucesso');
   } catch(e) {
     console.error('Erro ao inicializar app:', e);
