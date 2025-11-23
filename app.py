@@ -563,9 +563,11 @@ class WakeWordDetector:
     
     def __init__(self):
         self.running = False
+        self.paused = False  # Flag para pausar temporariamente durante conversação
         self.thread = None
         self.porcupine = None
         self.audio_stream = None
+        self.pa = None  # Referência ao PyAudio para poder fechar/reabrir stream
         
     def start(self):
         """Inicia o detector em uma thread separada"""
@@ -604,12 +606,59 @@ class WakeWordDetector:
         self.thread.start()
         LOG.add(f"[wake-word] detector iniciado, aguardando palavra '{PORCUPINE_KEYWORD}'...")
     
+    def pause(self):
+        """Pausa temporariamente o detector (ex: durante conversação)"""
+        if not self.running:
+            return
+        if self.paused:
+            return
+        self.paused = True
+        LOG.add("[wake-word] ⏸ Detector pausado temporariamente")
+        # Fecha o stream de áudio para evitar conflitos
+        if self.audio_stream:
+            try:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+                self.audio_stream = None
+            except Exception as e:
+                LOG.add(f"[wake-word] ⚠️ Erro ao fechar stream ao pausar: {e}")
+    
+    def resume(self):
+        """Retoma o detector após pausa"""
+        if not self.running:
+            return
+        if not self.paused:
+            return
+        self.paused = False
+        LOG.add("[wake-word] ▶ Retomando detector...")
+        # Reabre o stream de áudio
+        if self.pa and self.porcupine:
+            try:
+                import pyaudio
+                self.audio_stream = self.pa.open(
+                    rate=self.porcupine.sample_rate,
+                    channels=1,
+                    format=pyaudio.paInt16,
+                    input=True,
+                    frames_per_buffer=self.porcupine.frame_length
+                )
+                LOG.add("[wake-word] ✓ Stream de áudio reaberto - detector ativo novamente")
+            except Exception as e:
+                LOG.add(f"[wake-word] ⚠️ Erro ao reabrir stream: {e}")
+                # Se falhar, tenta reiniciar completamente
+                LOG.add("[wake-word] 🔄 Reiniciando detector completamente...")
+                self.stop()
+                import time
+                time.sleep(0.5)  # Pequena pausa antes de reiniciar
+                self.start()
+    
     def stop(self):
         """Para o detector"""
         if not self.running:
             return
             
         self.running = False
+        self.paused = False
         if self.thread:
             self.thread.join(timeout=2)
         LOG.add("[wake-word] detector parado")
@@ -640,6 +689,7 @@ class WakeWordDetector:
             
             # Inicializa PyAudio
             pa = pyaudio.PyAudio()
+            self.pa = pa  # Salva referência para poder reabrir stream depois
             
             # Lista dispositivos de áudio disponíveis
             LOG.add(f"[wake-word] dispositivos de áudio disponíveis:")
@@ -675,6 +725,35 @@ class WakeWordDetector:
             
             while self.running:
                 try:
+                    # Se estiver pausado, aguarda um pouco e continua verificando
+                    if self.paused:
+                        import time
+                        time.sleep(0.1)  # Aguarda 100ms quando pausado
+                        continue
+                    
+                    # Verifica se o stream está aberto
+                    if not self.audio_stream:
+                        # Se não há stream mas não está pausado, tenta reabrir
+                        if self.pa and self.porcupine:
+                            try:
+                                self.audio_stream = self.pa.open(
+                                    rate=self.porcupine.sample_rate,
+                                    channels=1,
+                                    format=pyaudio.paInt16,
+                                    input=True,
+                                    frames_per_buffer=self.porcupine.frame_length
+                                )
+                                LOG.add("[wake-word] ✓ Stream de áudio reaberto")
+                            except Exception as stream_error:
+                                LOG.add(f"[wake-word] ⚠️ Erro ao reabrir stream: {stream_error}")
+                                import time
+                                time.sleep(1.0)  # Aguarda antes de tentar novamente
+                                continue
+                        else:
+                            import time
+                            time.sleep(0.5)
+                            continue
+                    
                     # Lê áudio do microfone
                     pcm = self.audio_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
                     pcm = struct.unpack_from("h" * self.porcupine.frame_length, pcm)
@@ -710,6 +789,17 @@ class WakeWordDetector:
                 except Exception as read_error:
                     if self.running:  # Só loga se ainda estiver rodando
                         LOG.add(f"[wake-word] erro ao ler/processar áudio: {read_error}")
+                        # Se o erro for relacionado ao stream, tenta reabrir
+                        if "stream" in str(read_error).lower() or "device" in str(read_error).lower():
+                            if self.audio_stream:
+                                try:
+                                    self.audio_stream.stop_stream()
+                                    self.audio_stream.close()
+                                except:
+                                    pass
+                                self.audio_stream = None
+                            import time
+                            time.sleep(1.0)  # Aguarda antes de tentar reabrir
                     
         except ImportError as e:
             LOG.add(f"[wake-word] ❌ erro ao importar bibliotecas: {e}")
@@ -753,6 +843,9 @@ class WakeWordDetector:
     def _trigger_conversation(self):
         """Inicia conversação com OpenAI quando palavra é detectada"""
         try:
+            # Pausa o detector para evitar conflitos de áudio
+            self.pause()
+            
             # Cria um novo event loop para a thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -761,8 +854,13 @@ class WakeWordDetector:
             loop.run_until_complete(CONVERSATION_MANAGER.handle_conversation())
             
             loop.close()
+            
+            # Retoma o detector após a conversação terminar
+            self.resume()
         except Exception as e:
             LOG.add(f"[wake-word] erro ao iniciar conversação: {e}")
+            # Garante que o detector seja retomado mesmo em caso de erro
+            self.resume()
     
     def _trigger_random_action(self):
         """Dispara ação aleatória quando palavra é detectada"""
@@ -1128,6 +1226,124 @@ CTRL = Controller()
 
 # Instância global do detector de wake word (criada depois do CTRL)
 WAKE_WORD_DETECTOR = WakeWordDetector()
+
+# ----------------- Auto-Connect Background Task -----------------
+
+class AutoConnectManager:
+    """Gerencia conexão automática - escaneia e conecta continuamente até conseguir"""
+    
+    def __init__(self):
+        self.running = False
+        self.task: Optional[asyncio.Task] = None
+    
+    async def _auto_connect_loop(self):
+        """Loop que escaneia e tenta conectar continuamente"""
+        LOG.add("[auto-connect] 🔄 Iniciando loop de conexão automática...")
+        scan_interval = 5.0  # Escaneia a cada 5 segundos quando não conectado
+        was_connected = False  # Track previous connection state
+        
+        while self.running:
+            try:
+                # Verifica se já está conectado
+                if CTRL.device.connected:
+                    # Se acabou de conectar (transição de desconectado para conectado)
+                    if not was_connected:
+                        LOG.add("[auto-connect] ✅ Furby conectado! Iniciando wake word detector...")
+                        # Inicia o wake word detector automaticamente
+                        WAKE_WORD_DETECTOR.start()
+                        was_connected = True
+                    # Se já estava conectado, verifica se o wake word detector está rodando
+                    elif not WAKE_WORD_DETECTOR.running:
+                        LOG.add("[auto-connect] ⚠️ Wake word detector não está rodando. Tentando iniciar...")
+                        WAKE_WORD_DETECTOR.start()
+                    
+                    await asyncio.sleep(2.0)  # Verifica a cada 2 segundos quando conectado
+                    continue
+                
+                # Não está conectado
+                if was_connected:
+                    LOG.add("[auto-connect] ⚠️ Furby desconectado. Parando wake word detector...")
+                    WAKE_WORD_DETECTOR.stop()
+                    was_connected = False
+                
+                # Tenta escanear e conectar
+                LOG.add("[auto-connect] 🔍 Não conectado. Escaneando dispositivos...")
+                
+                try:
+                    devices = await CTRL.scan()
+                    
+                    if devices and len(devices) > 0:
+                        # Tenta conectar ao primeiro Furby encontrado ou ao endereço preferido
+                        target_address = None
+                        
+                        if PREFERRED_ADDRESS:
+                            # Procura pelo endereço preferido primeiro
+                            for device in devices:
+                                if device.get("address") == PREFERRED_ADDRESS:
+                                    target_address = PREFERRED_ADDRESS
+                                    break
+                        
+                        # Se não encontrou o preferido ou não há preferido, usa o primeiro
+                        if not target_address and devices:
+                            target_address = devices[0].get("address")
+                        
+                        if target_address:
+                            LOG.add(f"[auto-connect] 🔌 Tentando conectar ao Furby @ {target_address}...")
+                            try:
+                                await CTRL.connect(target_address)
+                                if CTRL.device.connected:
+                                    LOG.add(f"[auto-connect] ✅ Conectado com sucesso ao Furby @ {target_address}!")
+                                    # Inicia o wake word detector imediatamente após conexão
+                                    LOG.add("[auto-connect] 🎤 Iniciando wake word detector automaticamente...")
+                                    WAKE_WORD_DETECTOR.start()
+                                    was_connected = True
+                                    await asyncio.sleep(0.5)  # Pequena pausa antes de continuar
+                                    continue
+                                else:
+                                    LOG.add("[auto-connect] ⚠️ Tentativa de conexão falhou (sem erro)")
+                            except Exception as conn_error:
+                                LOG.add(f"[auto-connect] ⚠️ Erro ao conectar: {conn_error}")
+                        else:
+                            LOG.add("[auto-connect] ⚠️ Nenhum endereço válido encontrado")
+                    else:
+                        LOG.add("[auto-connect] 🔍 Nenhum Furby encontrado no scan")
+                
+                except Exception as scan_error:
+                    LOG.add(f"[auto-connect] ⚠️ Erro no scan: {scan_error}")
+                
+                # Aguarda antes de tentar novamente
+                await asyncio.sleep(scan_interval)
+                
+            except asyncio.CancelledError:
+                LOG.add("[auto-connect] ⏹ Loop de conexão cancelado")
+                raise
+            except Exception as e:
+                LOG.add(f"[auto-connect] ❌ Erro no loop de conexão: {e}")
+                import traceback
+                LOG.add(f"[auto-connect] {traceback.format_exc()}")
+                await asyncio.sleep(scan_interval)
+    
+    def start(self):
+        """Inicia o loop de conexão automática"""
+        if self.running:
+            LOG.add("[auto-connect] ⚠️ Auto-connect já está rodando")
+            return
+        
+        self.running = True
+        self.task = asyncio.create_task(self._auto_connect_loop())
+        LOG.add("[auto-connect] ✅ Auto-connect iniciado")
+    
+    def stop(self):
+        """Para o loop de conexão automática"""
+        if not self.running:
+            return
+        
+        self.running = False
+        if self.task:
+            self.task.cancel()
+        LOG.add("[auto-connect] ⏹ Auto-connect parado")
+
+AUTO_CONNECT_MANAGER = AutoConnectManager()
 
 # ----------------- FastAPI -----------------
 
@@ -1929,6 +2145,20 @@ try {
 </body>
 </html>
 """
+
+@app.on_event("startup")
+async def startup_event():
+    """Inicia o auto-connect quando o app inicia"""
+    AUTO_CONNECT_MANAGER.start()
+    # Se já estiver conectado quando o app inicia, inicia o wake word detector
+    if CTRL.device.connected:
+        LOG.add("[startup] Furby já está conectado. Iniciando wake word detector...")
+        WAKE_WORD_DETECTOR.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Para o auto-connect quando o app encerra"""
+    AUTO_CONNECT_MANAGER.stop()
 
 @app.get("/")
 async def index():
